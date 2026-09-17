@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-audio"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-core",
  "airplay-crypto",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-bluetooth"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-audio",
  "airplay-core",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-audio",
  "airplay-core",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "proptest",
  "serde",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-crypto"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-discovery"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-core",
  "async-stream",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-pairing"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "airplay-core",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-resampler"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-core",
  "fastrand",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-rtsp"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-core",
  "airplay-crypto",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-timing"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-core",
  "async-trait",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "airplay-tui"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-bluetooth",
  "airplay-client",
@@ -4187,7 +4187,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vulpicast"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "airplay-audio",
  "airplay-client",
