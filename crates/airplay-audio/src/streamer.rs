@@ -29,6 +29,51 @@ pub enum StreamerState {
     Error,
 }
 
+/// Depth of the queue between the async producer and the real-time sender thread.
+///
+/// At 352 frames/packet and 44.1kHz each slot is ~8ms, so 32 slots are ~250ms of
+/// slack. This is what lets the sender keep transmitting on schedule while the
+/// producer is briefly descheduled; the previous depth of 8 (~64ms) was too thin
+/// to survive a single Windows scheduler tick of delay.
+///
+/// Live streaming sizes this from the configured latency budget instead (see
+/// [`split_latency_budget`]); this constant is the fixed depth used for file
+/// playback, where latency does not matter.
+const SENDER_QUEUE_DEPTH: usize = 32;
+
+/// Default total local buffering for live streams, in milliseconds.
+pub const DEFAULT_LIVE_BUFFER_MS: u32 = 1000;
+
+/// Smallest latency budget a caller may request. Below this the stream cannot
+/// survive even a single scheduler hiccup.
+pub const MIN_LIVE_BUFFER_MS: u32 = 50;
+
+/// Largest latency budget a caller may request.
+pub const MAX_LIVE_BUFFER_MS: u32 = 5000;
+
+/// Split a total local latency budget into a sender-queue depth and a ring
+/// buffer target.
+///
+/// Audio waits in two places on the way out: the ring buffer that the decode
+/// side fills, and the queue feeding the real-time sender thread. The sender
+/// queue always runs full (the producer is paced by its back-pressure), so both
+/// count fully towards latency and both have to shrink together when the user
+/// asks for less.
+///
+/// A quarter of the budget goes to the sender queue, which is what absorbs
+/// producer-side scheduling hiccups, with a floor of 4 packets so there is
+/// always some slack, and a cap where more slack stops helping.
+///
+/// Returns `(sender_queue_packets, ring_buffer_ms)`.
+fn split_latency_budget(total_ms: u32, frame_ms: f64) -> (usize, u32) {
+    let total_ms = total_ms.clamp(MIN_LIVE_BUFFER_MS, MAX_LIVE_BUFFER_MS);
+    let total_packets = (total_ms as f64 / frame_ms).round() as usize;
+    let queue_packets = (total_packets / 4).clamp(4, 32);
+    let queue_ms = (queue_packets as f64 * frame_ms).round() as u32;
+    let ring_ms = total_ms.saturating_sub(queue_ms).max(frame_ms.ceil() as u32 * 2);
+    (queue_packets, ring_ms)
+}
+
 /// Try to set real-time priority for the current thread (Linux only).
 #[cfg(target_os = "linux")]
 fn set_realtime_priority() {
@@ -53,7 +98,25 @@ fn set_realtime_priority() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Raise the current thread to time-critical priority (Windows).
+///
+/// The sender thread wakes every ~8ms to put a packet on the wire. At normal
+/// priority it competes with every other thread on the machine, and being
+/// descheduled for one scheduler tick is enough to stall the audio stream.
+#[cfg(target_os = "windows")]
+fn set_realtime_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    if ok != 0 {
+        tracing::info!("Set real-time priority (THREAD_PRIORITY_TIME_CRITICAL)");
+    } else {
+        tracing::warn!("Failed to set thread priority");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn set_realtime_priority() {
     tracing::debug!("RT priority not supported on this platform");
 }
@@ -396,6 +459,12 @@ struct StreamerInner {
     use_ptp_sync: bool,
     /// PTP master clock identity (from BMCA, used in PT=87 packets).
     ptp_master_clock_id: [u8; 8],
+    /// Total local buffering budget for live streams, in milliseconds.
+    ///
+    /// This is the latency the user trades against robustness: a small budget
+    /// means audio reaches the speaker sooner but a single stall is audible, a
+    /// large one rides out stalls at the cost of delay.
+    live_buffer_ms: u32,
 }
 
 /// High-level audio streamer.
@@ -452,6 +521,7 @@ impl AudioStreamer {
                 render_delay_ns: 0,
                 use_ptp_sync: false,
                 ptp_master_clock_id: [0u8; 8],
+                live_buffer_ms: DEFAULT_LIVE_BUFFER_MS,
             })),
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
@@ -492,6 +562,15 @@ impl AudioStreamer {
     /// This shifts NTP timestamps in sync packets into the future, telling
     /// the receiver to buffer audio longer before rendering. This gives more
     /// time for retransmit recovery of lost packets.
+    /// Set the total local buffering budget for live streams, in milliseconds.
+    ///
+    /// Must be called before [`start_live`](Self::start_live); it has no effect
+    /// on a stream that is already running. Values are clamped to
+    /// [`MIN_LIVE_BUFFER_MS`]..=[`MAX_LIVE_BUFFER_MS`].
+    pub async fn set_live_buffer_ms(&mut self, ms: u32) {
+        self.inner.lock().await.live_buffer_ms = ms.clamp(MIN_LIVE_BUFFER_MS, MAX_LIVE_BUFFER_MS);
+    }
+
     pub async fn set_render_delay_ms(&mut self, delay_ms: u32) {
         let delay_ns = delay_ms as u64 * 1_000_000;
         self.inner.lock().await.render_delay_ns = delay_ns;
@@ -579,7 +658,10 @@ impl AudioStreamer {
 
         if self.task.is_none() {
             // Set up the dedicated sender thread with cloned sockets
-            let (tx, rx) = bounded::<SenderMessage>(8);
+            // ~250ms of slack between the async producer and the real-time sender
+            // thread, so a scheduling hiccup on the producer side does not leave
+            // the sender with nothing to transmit.
+            let (tx, rx) = bounded::<SenderMessage>(SENDER_QUEUE_DEPTH);
             let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
 
             {
@@ -656,41 +738,72 @@ impl AudioStreamer {
     /// This is similar to `start()` but uses a `LiveAudioDecoder` that receives
     /// PCM frames from a channel, enabling streaming from external sources like
     /// Bluetooth audio capture.
-    pub async fn start_live(&mut self, live_decoder: LiveAudioDecoder) -> Result<()> {
+    pub async fn start_live(&mut self, mut live_decoder: LiveAudioDecoder) -> Result<()> {
         let frame_duration_ns;
+        let queue_depth;
+        let prefill_frames;
+        let budget_ms;
         {
             let mut inner = self.inner.lock().await;
+            // The send loop must never block on the capture channel: a blocking
+            // receive there delays packet transmission, and on Windows a short
+            // timeout is rounded up to the ~15.6ms scheduler tick, which starves
+            // the sender thread and produces audible crackling.
+            live_decoder.set_recv_timeout(std::time::Duration::ZERO);
             inner.live_decoder = Some(live_decoder);
             inner.decoder = None; // Clear file decoder if any
             inner.encoder = Some(create_encoder(inner.config.audio_format.clone())?);
             inner.state = StreamerState::Buffering;
-            frame_duration_ns = inner.config.audio_format.frames_per_packet as u64
-                * 1_000_000_000u64
-                / inner.config.audio_format.sample_rate.as_hz() as u64;
+
+            let format = inner.config.audio_format.clone();
+            let frames_per_packet = format.frames_per_packet as u64;
+            let sample_rate = format.sample_rate.as_hz() as u64;
+            frame_duration_ns = frames_per_packet * 1_000_000_000u64 / sample_rate;
+            let frame_ms = frame_duration_ns as f64 / 1_000_000.0;
+
+            budget_ms = inner.live_buffer_ms;
+            let (qd, ring_ms) = split_latency_budget(budget_ms, frame_ms);
+            queue_depth = qd;
+            prefill_frames = ((ring_ms as f64 / frame_ms).round() as usize).max(1);
+
+            // Size the ring buffer to the requested target plus headroom, so the
+            // decode side can keep it topped up instead of hitting the cap.
+            let capacity_ms = ring_ms.saturating_mul(3) / 2 + 250;
+            inner.buffer = AudioBuffer::new(format, capacity_ms);
+
+            tracing::info!(
+                "Live latency budget {}ms = {} queued packets (~{:.0}ms) + {} buffered packets (~{}ms), ring capacity {}ms",
+                budget_ms,
+                queue_depth,
+                queue_depth as f64 * frame_ms,
+                prefill_frames,
+                ring_ms,
+                capacity_ms
+            );
         }
         self.state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
 
-        // For live streaming, wait for initial buffer fill before streaming.
-        // This prevents startup artifacts from sending packets before we have
-        // enough audio data buffered. Target ~500ms of buffer (about 60 packets
-        // at 352 frames/packet, 44.1kHz).
+        // Wait for the ring buffer to reach the configured fill before sending.
+        // Starting with an empty buffer means immediate underruns; starting with
+        // more than the budget means permanent extra latency, because for a live
+        // source nothing ever drains the surplus back out.
         tracing::info!("Live streaming: waiting for initial buffer fill...");
         let buffer_start = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(5);
-        let target_fill_pct = 50.0; // Wait for 50% of 2000ms buffer = 1000ms
+        // The source is real-time, so filling N ms of buffer takes N ms. Allow
+        // the budget plus slack before giving up and starting anyway.
+        let max_wait = std::time::Duration::from_millis(budget_ms as u64 + 2000);
 
         loop {
             // Try to decode some frames into the buffer
             {
                 let mut guard = self.inner.lock().await;
-                decode_some_inner(&mut guard)?;
-                let fill_pct = guard.buffer.fill_percentage();
+                decode_some_inner(&mut guard, DECODE_BATCH_PREFILL)?;
                 let frame_count = guard.buffer.len();
 
-                if fill_pct >= target_fill_pct {
+                if frame_count >= prefill_frames {
                     tracing::info!(
-                        "Live streaming: buffer ready at {:.1}% ({} frames), starting playback",
-                        fill_pct, frame_count
+                        "Live streaming: buffer ready ({} frames), starting playback",
+                        frame_count
                     );
                     guard.state = StreamerState::Streaming;
                     self.state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
@@ -699,28 +812,23 @@ impl AudioStreamer {
 
                 if buffer_start.elapsed() > max_wait {
                     tracing::warn!(
-                        "Live streaming: buffer timeout at {:.1}% ({} frames), starting anyway",
-                        fill_pct, frame_count
+                        "Live streaming: buffer timeout at {}/{} frames, starting anyway",
+                        frame_count, prefill_frames
                     );
                     guard.state = StreamerState::Streaming;
                     self.state_cache.store(StreamerState::Streaming as u8, Ordering::Relaxed);
                     break;
                 }
-
-                if buffer_start.elapsed().as_millis() % 500 == 0 {
-                    tracing::debug!(
-                        "Live streaming: buffering {:.1}% ({} frames)...",
-                        fill_pct, frame_count
-                    );
-                }
             }
             // Small delay before retry
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         if self.task.is_none() {
             // Set up the dedicated sender thread with cloned sockets
-            let (tx, rx) = bounded::<SenderMessage>(8);
+            // Depth comes from the latency budget: this queue always runs full,
+            // so every slot in it is latency as well as slack.
+            let (tx, rx) = bounded::<SenderMessage>(queue_depth);
             let frame_duration = std::time::Duration::from_nanos(frame_duration_ns);
 
             {
@@ -904,20 +1012,35 @@ impl AudioStreamer {
     /// Internal: decode some audio into buffer.
     async fn decode_some(&mut self) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        decode_some_inner(&mut inner)?;
+        decode_some_inner(&mut inner, DECODE_BATCH_REALTIME)?;
         Ok(())
     }
 }
 
-fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
+/// Number of packets pulled per decode call from the real-time send loop.
+///
+/// The live decoder is non-blocking there (see [`LiveAudioDecoder::set_recv_timeout`]),
+/// so a batch is a few memcpys and costs microseconds; it stops early as soon as
+/// the source runs dry. A larger batch keeps the capture channel drained, which
+/// is what prevents the capture thread from dropping frames.
+const DECODE_BATCH_REALTIME: usize = 8;
+
+/// Number of packets pulled per decode call while pre-filling the buffer.
+const DECODE_BATCH_PREFILL: usize = 64;
+
+fn decode_some_inner(inner: &mut StreamerInner, max_frames: usize) -> Result<()> {
     let format = inner.config.audio_format.clone();
     let frames_per_packet = format.frames_per_packet as usize;
     let is_live = inner.live_decoder.is_some();
 
-    // Decode 3 frames per batch to minimize blocking in send loop.
-    // Very small batches ensure minimal interference with precise timing.
-    // With 2ms timeout per frame, worst case is ~6ms blocking.
-    for _ in 0..3 {
+    for _ in 0..max_frames {
+        // Never decode into a full buffer: push() would fail and the error would
+        // tear down the whole stream. Leaving the data in the source channel is
+        // the correct back-pressure.
+        if inner.buffer.is_full() {
+            break;
+        }
+
         // Try live decoder first (for Bluetooth/external sources), then file decoder
         let frame = if let Some(ref mut live_decoder) = inner.live_decoder {
             live_decoder.decode_resampled(&format, frames_per_packet)?
@@ -929,10 +1052,10 @@ fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
 
         if let Some(frame) = frame {
             let audio_frame = crate::AudioFrame::new(frame.samples, frame.timestamp);
-            inner
-                .buffer
-                .push(audio_frame)
-                .map_err(|_| airplay_core::error::StreamingError::BufferOverflow)?;
+            if inner.buffer.push(audio_frame).is_err() {
+                // Raced with the check above; drop the batch rather than the stream.
+                break;
+            }
         } else if is_live {
             // For live streams, None means timeout (no data yet), not EOF.
             // Don't break - just return and try again later.
@@ -995,14 +1118,16 @@ async fn run_streamer(
                     guard.clock_offset = Some(latest);
                 }
             }
-            // Keep buffer above 40% but don't decode too aggressively
-            // to avoid blocking the send loop with decode operations.
-            // With 50% initial fill, we have plenty of headroom.
-            if guard.buffer.fill_percentage() < 40.0 {
+            // Top the buffer up on every iteration. Decoding is non-blocking for
+            // live sources and returns immediately when the source is dry, so
+            // there is no reason to let the buffer drain first — keeping it full
+            // is what absorbs scheduling hiccups, and draining the capture
+            // channel promptly is what stops the capture thread dropping frames.
+            if !guard.buffer.is_full() {
                 let decode_start = Instant::now();
-                decode_some_inner(&mut guard)?;
+                decode_some_inner(&mut guard, DECODE_BATCH_REALTIME)?;
                 let decode_elapsed = decode_start.elapsed();
-                if decode_elapsed.as_millis() > 10 {
+                if decode_elapsed.as_millis() > 5 {
                     tracing::warn!(
                         "Decode took {:.2}ms (blocking send loop!)",
                         decode_elapsed.as_secs_f64() * 1000.0

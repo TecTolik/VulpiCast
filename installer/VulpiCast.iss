@@ -38,10 +38,10 @@ VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription=VulpiCast Installer
 
 [Languages]
-Name: "german"; MessagesFile: "compiler:Languages\German.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Desktop-Verknüpfung erstellen"; GroupDescription: "Zusätzliche Verknüpfungen:"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
 Source: "{#ProjectRoot}target\release\vulpicast.exe"; DestDir: "{app}"; DestName: "VulpiCast.exe"; Flags: ignoreversion
@@ -54,7 +54,7 @@ Name: "{autodesktop}\VulpiCast"; Filename: "{app}\VulpiCast.exe"; WorkingDir: "{
 [Run]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""VulpiCast (AirPlay 2)"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""VulpiCast (AirPlay 2)"" dir=in action=allow program=""{app}\VulpiCast.exe"" enable=yes profile=private"; Flags: runhidden waituntilterminated
-Filename: "{app}\VulpiCast.exe"; Description: "VulpiCast jetzt starten"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\VulpiCast.exe"; Description: "Launch VulpiCast now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""VulpiCast (AirPlay 2)"""; Flags: runhidden waituntilterminated; RunOnceId: "RemoveVulpiCastFirewallRule"

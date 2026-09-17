@@ -6,6 +6,7 @@
 
 use airplay_core::{AudioFormat, error::Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::decoder::DecodedFrame;
@@ -24,17 +25,30 @@ pub struct LivePcmFrame {
 /// Sender for pushing live PCM frames to a LiveAudioDecoder.
 pub struct LiveFrameSender {
     tx: Sender<LivePcmFrame>,
+    /// Number of frames dropped because the channel was full. A dropped frame
+    /// is audio that never reaches the receiver, i.e. an audible discontinuity,
+    /// so this is logged rather than silently swallowed.
+    dropped: AtomicU64,
 }
 
 impl LiveFrameSender {
     /// Send a frame of PCM audio.
     ///
     /// Returns true if the frame was sent, false if the channel is full.
+    ///
+    /// A full channel means the consumer is not keeping up: the frame is
+    /// dropped (live audio cannot be delayed indefinitely) and the drop is
+    /// logged at WARN, rate-limited to one message per 100 drops.
     pub fn try_send(&self, frame: LivePcmFrame) -> bool {
         match self.tx.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                tracing::debug!("Live audio channel full, dropping frame");
+                let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 100 == 1 {
+                    tracing::warn!(
+                        "Live audio channel full, dropping {n} frames so far - consumer is not draining fast enough, expect audible glitches"
+                    );
+                }
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -42,6 +56,11 @@ impl LiveFrameSender {
                 false
             }
         }
+    }
+
+    /// Total number of frames dropped because the channel was full.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Send a frame, blocking if the channel is full.
@@ -81,9 +100,14 @@ pub struct LiveAudioDecoder {
 impl LiveAudioDecoder {
     /// Create a new live decoder with the given channel receiver.
     ///
-    /// NOTE: The default receive timeout is 5ms to prevent blocking the streamer
-    /// loop when the capture catches up. This allows the streamer to continue
-    /// running and sending buffered frames even when no new data is available.
+    /// NOTE: The default receive timeout is 2ms. In the real-time send loop this
+    /// must be set to [`Duration::ZERO`] via [`set_recv_timeout`], which switches
+    /// the decoder to a purely non-blocking `try_recv`. Any blocking wait inside
+    /// the send loop stalls packet transmission, and on Windows a sub-tick
+    /// timeout is rounded up to the 15.6ms scheduler granularity, which starves
+    /// the sender thread and causes audible crackling.
+    ///
+    /// [`set_recv_timeout`]: LiveAudioDecoder::set_recv_timeout
     pub fn new(rx: Receiver<LivePcmFrame>, sample_rate: u32, channels: u8) -> Self {
         Self {
             rx,
@@ -103,12 +127,19 @@ impl LiveAudioDecoder {
     /// Channel capacity controls buffering (typically 8-16 frames).
     pub fn create_pair(sample_rate: u32, channels: u8, capacity: usize) -> (LiveFrameSender, Self) {
         let (tx, rx) = bounded::<LivePcmFrame>(capacity);
-        let sender = LiveFrameSender { tx };
+        let sender = LiveFrameSender {
+            tx,
+            dropped: AtomicU64::new(0),
+        };
         let decoder = Self::new(rx, sample_rate, channels);
         (sender, decoder)
     }
 
     /// Set the receive timeout.
+    ///
+    /// [`Duration::ZERO`] makes [`decode_frame`](Self::decode_frame) fully
+    /// non-blocking (`try_recv`): it returns `None` immediately when no data is
+    /// queued. Use this whenever the decoder is driven from a real-time loop.
     pub fn set_recv_timeout(&mut self, timeout: Duration) {
         self.recv_timeout = timeout;
     }
@@ -152,7 +183,22 @@ impl LiveAudioDecoder {
             return Ok(None);
         }
 
-        match self.rx.recv_timeout(self.recv_timeout) {
+        // A zero timeout means "never block": used by the real-time send loop,
+        // where even a 1ms wait delays packet transmission.
+        let received = if self.recv_timeout.is_zero() {
+            self.rx.try_recv().map_err(|e| match e {
+                crossbeam_channel::TryRecvError::Empty => {
+                    crossbeam_channel::RecvTimeoutError::Timeout
+                }
+                crossbeam_channel::TryRecvError::Disconnected => {
+                    crossbeam_channel::RecvTimeoutError::Disconnected
+                }
+            })
+        } else {
+            self.rx.recv_timeout(self.recv_timeout)
+        };
+
+        match received {
             Ok(frame) => {
                 let num_frames = frame.samples.len() / frame.channels as usize;
                 let decoded = DecodedFrame {

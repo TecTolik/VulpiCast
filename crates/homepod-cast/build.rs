@@ -3,9 +3,12 @@ fn main() {
         return;
     }
 
+    println!("cargo:rerun-if-changed=VulpiCast.exe.manifest");
+
     let mut resource = winresource::WindowsResource::new();
     resource
         .set_icon("../../assets/vulpicast.ico")
+        .set_manifest_file("VulpiCast.exe.manifest")
         .set("ProductName", "VulpiCast")
         .set(
             "FileDescription",

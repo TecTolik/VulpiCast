@@ -13,8 +13,33 @@ mod tray;
 
 use std::time::Duration;
 
+/// Raise the Windows timer resolution to 1ms for the lifetime of the process.
+///
+/// Without this a process gets the default ~15.6ms scheduler granularity, so
+/// *every* short sleep or channel timeout in the audio path is rounded up to a
+/// full tick. In the real-time send loop that turns a 2ms wait into a 15.6ms
+/// stall, which starves the sender thread and is audible as crackling.
+struct TimerResolution;
+
+impl TimerResolution {
+    fn acquire() -> Self {
+        let r = unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+        if r != 0 {
+            tracing::warn!("could not raise timer resolution to 1ms (code {r})");
+        }
+        Self
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(1) };
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let log_path = cast::init_logging()?;
+    let _timer_resolution = TimerResolution::acquire();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -36,7 +61,13 @@ fn main() -> anyhow::Result<()> {
             };
             tracing::info!("selftest target: {} ({})", dev.name, dev.model);
             tracing::info!("=== starting session ===");
-            match cast::Session::start(dev.clone(), cast::DEFAULT_VOLUME).await {
+            match cast::Session::start(
+                dev.clone(),
+                cast::DEFAULT_VOLUME,
+                cast::load_mode(),
+            )
+            .await
+            {
                 Ok(mut s) => {
                     let secs = 50u32;
                     tracing::info!("streaming for {secs}s with 2s keepalive (play audio now)");

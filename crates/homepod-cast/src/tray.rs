@@ -5,9 +5,10 @@
 //! active streaming session, and reports the *true* state back so the icon and
 //! check marks stay correct (e.g. if a connection fails).
 //!
-//! Volume and the global toggle hotkey are configured in a small native
-//! settings window (see [`crate::settings_window`]): the slider applies volume
-//! live, and Save reports a new hotkey which the main thread re-registers.
+//! Volume, the streaming mode and the global toggle hotkey are configured in a
+//! small native settings window (see [`crate::settings_window`]): the slider
+//! applies volume live, and Save reports the hotkey (which the main thread
+//! re-registers) along with the streaming mode.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -39,6 +40,9 @@ enum Cmd {
     Stop,
     Rescan,
     SetVolume(f32),
+    /// New streaming mode. Applied immediately by reconnecting if a stream is
+    /// running, since the buffer size is fixed when the stream starts.
+    SetMode(cast::StreamingMode),
     Quit,
 }
 
@@ -78,7 +82,7 @@ pub fn run() -> anyhow::Result<()> {
     // Wait for the initial device scan.
     let initial_update = dev_rx
         .recv_timeout(Duration::from_secs(8))
-        .unwrap_or_else(|_| DeviceUpdate::Failed("Gerätesuche hat zu lange gedauert".into()));
+        .unwrap_or_else(|_| DeviceUpdate::Failed("Device discovery timed out".into()));
     let names = match &initial_update {
         DeviceUpdate::Ready(names) => names.clone(),
         DeviceUpdate::Failed(_) => Vec::new(),
@@ -88,7 +92,7 @@ pub fn run() -> anyhow::Result<()> {
     let menu = Menu::new();
 
     // Single-selection group: "Stopped" + one item per device. Starts stopped.
-    let off_check = CheckMenuItem::new("\u{25A0}  Gestoppt", true, true, None);
+    let off_check = CheckMenuItem::new("\u{25A0}  Stopped", true, true, None);
     menu.append(&off_check)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
@@ -104,36 +108,36 @@ pub fn run() -> anyhow::Result<()> {
     )?;
     menu.append(&PredefinedMenuItem::separator())?;
 
-    let rescan_item = MenuItem::new("Neu nach AirPlay-2-Geräten suchen", true, None);
+    let rescan_item = MenuItem::new("Rescan for AirPlay 2 devices", true, None);
     let rescan_id = rescan_item.id().clone();
     menu.append(&rescan_item)?;
 
-    let log_item = MenuItem::new("Protokollordner öffnen", true, None);
+    let log_item = MenuItem::new("Open log folder", true, None);
     let log_id = log_item.id().clone();
     menu.append(&log_item)?;
 
-    let status_item = MenuItem::new("Bereit — nur AirPlay 2", false, None);
+    let status_item = MenuItem::new("Ready — AirPlay 2 only", false, None);
     menu.append(&status_item)?;
     if let DeviceUpdate::Failed(message) = initial_update {
-        status_item.set_text("Gerätesuche fehlgeschlagen — siehe Protokoll");
+        status_item.set_text("Device discovery failed — see log");
         tracing::error!("initial discovery failed: {message}");
     }
     menu.append(&PredefinedMenuItem::separator())?;
 
     // Settings: opens a window with a volume slider and a hotkey capture box.
-    let settings_item = MenuItem::new("Einstellungen\u{2026}", true, None);
+    let settings_item = MenuItem::new("Settings\u{2026}", true, None);
     menu.append(&settings_item)?;
     let settings_id = settings_item.id().clone();
     menu.append(&PredefinedMenuItem::separator())?;
 
-    let quit_item = MenuItem::new("Beenden", true, None);
+    let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&quit_item)?;
     let quit_id = quit_item.id().clone();
     let off_id = off_check.id().clone();
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
-        .with_tooltip("VulpiCast — bereit (nur AirPlay 2)")
+        .with_tooltip("VulpiCast — ready (AirPlay 2 only)")
         .with_icon(make_icon(false))
         .build()?;
 
@@ -181,25 +185,30 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 apply_state(&off_check, &device_checks, &tray, active);
             } else if ev.id == settings_id {
-                // Open the settings window: volume applies live via Cmd::SetVolume,
-                // a chosen hotkey comes back on hk_tx for the main thread to register.
+                // Open the settings window: volume applies live via Cmd::SetVolume;
+                // on Save the hotkey comes back on hk_tx for the main thread to
+                // register and the streaming mode goes straight to the control
+                // thread, which owns the session.
                 let vol_tx = cmd_tx.clone();
+                let mode_tx = cmd_tx.clone();
                 let hotkey_tx = hk_tx.clone();
                 settings_window::open(
                     cast::load_volume(),
                     cur_mods,
                     cur_vk,
+                    cast::load_mode(),
                     move |v| {
                         let _ = vol_tx.send(Cmd::SetVolume(v));
                     },
-                    move |m, vk| {
+                    move |m, vk, mode| {
                         let _ = hotkey_tx.send((m, vk));
+                        let _ = mode_tx.send(Cmd::SetMode(mode));
                     },
                 );
             } else if ev.id == rescan_id {
                 let _ = cmd_tx.send(Cmd::Rescan);
                 active = None;
-                status_item.set_text("Suche läuft\u{2026}");
+                status_item.set_text("Scanning\u{2026}");
                 apply_state(&off_check, &device_checks, &tray, active);
             } else if ev.id == log_id {
                 if let Err(e) = std::process::Command::new("explorer.exe")
@@ -235,7 +244,7 @@ pub fn run() -> anyhow::Result<()> {
                         &mut no_devices_item,
                     )?;
                     last_device = 0;
-                    status_item.set_text("Bereit — nur AirPlay 2");
+                    status_item.set_text("Ready — AirPlay 2 only");
                 }
                 DeviceUpdate::Failed(message) => {
                     tracing::error!("discovery failed: {message}");
@@ -246,8 +255,8 @@ pub fn run() -> anyhow::Result<()> {
                         &mut device_ids,
                         &mut no_devices_item,
                     )?;
-                    status_item.set_text("Gerätesuche fehlgeschlagen — siehe Protokoll");
-                    tooltip_override = Some("VulpiCast — Gerätesuche fehlgeschlagen".to_string());
+                    status_item.set_text("Device discovery failed — see log");
+                    tooltip_override = Some("VulpiCast — device discovery failed".to_string());
                 }
             }
             apply_state(&off_check, &device_checks, &tray, active);
@@ -270,16 +279,16 @@ pub fn run() -> anyhow::Result<()> {
             active = match st {
                 Status::Streaming(i) => {
                     last_device = i;
-                    status_item.set_text("Verbunden über natives AirPlay 2");
+                    status_item.set_text("Connected via native AirPlay 2");
                     Some(i)
                 }
                 Status::Stopped => {
-                    status_item.set_text("Bereit — nur AirPlay 2");
+                    status_item.set_text("Ready — AirPlay 2 only");
                     None
                 }
                 Status::Error(message) => {
                     tracing::error!("streaming error: {message}");
-                    status_item.set_text("Verbindung fehlgeschlagen — siehe Protokoll");
+                    status_item.set_text("Connection failed — see log");
                     let short = if message.chars().count() > 100 {
                         format!("{}\u{2026}", message.chars().take(100).collect::<String>())
                     } else {
@@ -320,9 +329,9 @@ fn apply_state(
     }
     let _ = tray.set_icon(Some(make_icon(active.is_some())));
     if active.is_some() {
-        let _ = tray.set_tooltip(Some("VulpiCast — Streaming über AirPlay 2"));
+        let _ = tray.set_tooltip(Some("VulpiCast — streaming via AirPlay 2"));
     } else {
-        let _ = tray.set_tooltip(Some("VulpiCast — bereit (nur AirPlay 2)"));
+        let _ = tray.set_tooltip(Some("VulpiCast — ready (AirPlay 2 only)"));
     }
 }
 
@@ -342,7 +351,7 @@ fn replace_device_menu(
     }
 
     if names.is_empty() {
-        let item = MenuItem::new("Keine AirPlay-2-Geräte gefunden", false, None);
+        let item = MenuItem::new("No AirPlay 2 devices found", false, None);
         menu.insert(&item, 2)?;
         *no_devices = Some(item);
     } else {
@@ -385,6 +394,10 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
 
     let mut session: Option<cast::Session> = None;
     let mut volume = cast::load_volume();
+    let mut mode = cast::load_mode();
+    // Which device the running session belongs to, so a mode change can restart
+    // it on the same target.
+    let mut active_idx: Option<usize> = None;
     let mut last_feedback = std::time::Instant::now();
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(1000)) {
@@ -392,20 +405,21 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
                 if let Some(s) = session.take() {
                     rt.block_on(s.stop());
                 }
+                active_idx = None;
                 if let Some(dev) = devices.get(idx).cloned() {
                     let name = dev.name.clone();
-                    match rt.block_on(cast::Session::start(dev, volume)) {
+                    match rt.block_on(cast::Session::start(dev, volume, mode)) {
                         Ok(s) => {
                             tracing::info!("streaming to {name}");
                             session = Some(s);
+                            active_idx = Some(idx);
                             last_feedback = std::time::Instant::now();
                             let _ = status_tx.send(Status::Streaming(idx));
                         }
                         Err(e) => {
                             tracing::error!("failed to start streaming to {name}: {e:#}");
-                            let _ = status_tx.send(Status::Error(format!(
-                                "Verbindung zu {name} fehlgeschlagen: {e:#}"
-                            )));
+                            let _ = status_tx
+                                .send(Status::Error(format!("Connection to {name} failed: {e:#}")));
                         }
                     }
                 }
@@ -415,12 +429,14 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
                     rt.block_on(s.stop());
                     tracing::info!("stopped");
                 }
+                active_idx = None;
                 let _ = status_tx.send(Status::Stopped);
             }
             Ok(Cmd::Rescan) => {
                 if let Some(s) = session.take() {
                     rt.block_on(s.stop());
                 }
+                active_idx = None;
                 let _ = status_tx.send(Status::Stopped);
                 match rt.block_on(cast::discover(Duration::from_secs(3))) {
                     Ok(found) => {
@@ -440,6 +456,37 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
                 cast::save_volume(v);
                 if let Some(s) = session.as_mut() {
                     rt.block_on(s.set_volume(v));
+                }
+            }
+            Ok(Cmd::SetMode(new_mode)) => {
+                if new_mode != mode {
+                    mode = new_mode;
+                    cast::save_mode(mode);
+                    tracing::info!("streaming mode set to {}ms buffer", mode.latency_ms());
+                    // The buffer size is baked in when the stream starts, so a
+                    // running stream has to be reconnected to pick it up.
+                    if let (Some(s), Some(idx)) = (session.take(), active_idx) {
+                        rt.block_on(s.stop());
+                        active_idx = None;
+                        if let Some(dev) = devices.get(idx).cloned() {
+                            let name = dev.name.clone();
+                            match rt.block_on(cast::Session::start(dev, volume, mode)) {
+                                Ok(s) => {
+                                    tracing::info!("restarted stream to {name} with new mode");
+                                    session = Some(s);
+                                    active_idx = Some(idx);
+                                    last_feedback = std::time::Instant::now();
+                                    let _ = status_tx.send(Status::Streaming(idx));
+                                }
+                                Err(e) => {
+                                    tracing::error!("failed to restart streaming to {name}: {e:#}");
+                                    let _ = status_tx.send(Status::Error(format!(
+                                        "Connection to {name} failed: {e:#}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Ok(Cmd::Quit) => {
@@ -469,8 +516,9 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
             if let Some(s) = session.take() {
                 rt.block_on(s.stop());
             }
+            active_idx = None;
             let _ = status_tx.send(Status::Error(format!(
-                "AirPlay-Verbindung wurde unterbrochen: {e:#}"
+                "AirPlay connection was interrupted: {e:#}"
             )));
         }
     }

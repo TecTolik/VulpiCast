@@ -16,6 +16,23 @@ use airplay_audio::{
 };
 use airplay_core::{AudioFormat, AudioCodec, SampleRate};
 
+/// Raise the Windows timer resolution to 1ms for this test process.
+///
+/// The simulated streamer loops below pace themselves with millisecond sleeps
+/// and short channel timeouts. A Windows process that has not asked for a finer
+/// timer gets the default ~15.6ms scheduler granularity, so every one of those
+/// waits is rounded up to a full tick and the loop runs at a fraction of the
+/// intended rate. The real application does the same thing at startup.
+///
+/// The elevation is process-wide and is deliberately never released: the test
+/// binary exits shortly after, and tests run concurrently in one process.
+fn raise_timer_resolution() {
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+}
+
 /// Generate a stereo sine wave for testing.
 fn generate_sine_wave(frequency: f64, sample_rate: u32, num_frames: usize) -> Vec<i16> {
     let mut samples = Vec::with_capacity(num_frames * 2);
@@ -329,6 +346,7 @@ fn test_buffer_integration() {
 #[test]
 fn test_continuous_streaming_simulation() {
     println!("\n=== Test: Continuous Streaming Simulation (like TUI) ===");
+    raise_timer_resolution();
 
     // This test simulates the full TUI -> Streamer flow
     let format = test_format();

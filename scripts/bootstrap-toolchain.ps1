@@ -52,5 +52,5 @@ if (-not (Test-Path -LiteralPath $gcc)) {
     }
 }
 
-Write-Host "Projektlokale Toolchain ist bereit."
-Write-Host "Jetzt .\build.ps1 ausführen."
+Write-Host "Project-local toolchain is ready."
+Write-Host "Now run .\build.ps1."

@@ -8,7 +8,7 @@ $mingwBin = Join-Path $root ".tools\mingw\mingw64\bin"
 $cargo = Join-Path $cargoHome "bin\cargo.exe"
 
 if (-not (Test-Path -LiteralPath $cargo) -or -not (Test-Path -LiteralPath (Join-Path $mingwBin "gcc.exe"))) {
-    throw "Lokale Rust-Build-Tools fehlen. Zuerst .\scripts\bootstrap-toolchain.ps1 ausführen."
+    throw "Local Rust build tools are missing. Run .\scripts\bootstrap-toolchain.ps1 first."
 }
 
 $isccCandidates = @(
@@ -18,7 +18,7 @@ $isccCandidates = @(
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 $iscc = $isccCandidates | Select-Object -First 1
 if (-not $iscc) {
-    throw "Inno Setup 7 fehlt. Zuerst .\scripts\bootstrap-installer.ps1 ausführen."
+    throw "Inno Setup 7 is missing. Run .\scripts\bootstrap-installer.ps1 first."
 }
 
 $manifest = Get-Content -LiteralPath (Join-Path $root "Cargo.toml") -Raw

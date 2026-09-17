@@ -218,6 +218,9 @@ pub struct Connection {
     ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     render_delay_ms: u32,
+    /// Total local buffering budget for live streams, in milliseconds.
+    /// `None` leaves the streamer default in place.
+    live_buffer_ms: Option<u32>,
     /// Equalizer configuration (set before streaming).
     eq_config: Option<EqConfig>,
     /// Shared equalizer parameters for real-time control.
@@ -340,6 +343,7 @@ impl Connection {
             control_task: None,
             events_stream: None,
             render_delay_ms: 0,
+            live_buffer_ms: None,
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
@@ -505,6 +509,7 @@ impl Connection {
             control_task: None,
             events_stream: None,
             render_delay_ms: 0,
+            live_buffer_ms: None,
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
@@ -706,6 +711,7 @@ impl Connection {
             control_task: None,
             events_stream: None,
             render_delay_ms: 0,
+            live_buffer_ms: None,
             eq_config: None,
             eq_params: None,
             stream_stats: crate::stats::StreamStats::new(),
@@ -1225,6 +1231,9 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
+        if let Some(ms) = self.live_buffer_ms {
+            streamer.set_live_buffer_ms(ms).await;
+        }
         if let Some(offset) = self.timing_offset {
             streamer.set_timing_offset(offset).await;
         }
@@ -1402,6 +1411,16 @@ impl Connection {
     /// Get the total buffer underruns from this connection's streamer (0 if no streamer).
     pub fn streamer_underruns(&self) -> u64 {
         self.streamer.as_ref().map_or(0, |s| s.underruns())
+    }
+
+    /// Set the total local buffering budget for live streams, in milliseconds.
+    ///
+    /// This is the latency/robustness trade-off for `start_streaming_live()`:
+    /// a small budget gets audio to the speaker sooner, a large one rides out
+    /// scheduling and network hiccups. Must be called before
+    /// `start_streaming_live()`.
+    pub fn set_live_buffer_ms(&mut self, ms: u32) {
+        self.live_buffer_ms = Some(ms);
     }
 
     /// Set render delay in milliseconds.

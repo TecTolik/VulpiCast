@@ -87,6 +87,82 @@ pub fn save_volume(v: f32) {
     }
 }
 
+/// How much audio VulpiCast buffers locally before it goes out on the wire.
+///
+/// This is the one knob that trades latency against robustness: everything in
+/// the buffer is delay, and everything in the buffer is also what rides out a
+/// scheduling or network hiccup without a dropout. The receiver adds its own
+/// fixed latency on top, which we cannot influence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamingMode {
+    /// Lowest delay. Any hiccup is audible.
+    RealTime,
+    /// The default: a compromise that survives ordinary WiFi jitter.
+    #[default]
+    Normal,
+    /// Most robust, noticeably delayed.
+    Buffered,
+    /// A latency chosen by the user, in milliseconds.
+    Custom(u32),
+}
+
+/// Buffer size of the real-time preset, in milliseconds.
+pub const MODE_REALTIME_MS: u32 = 200;
+/// Buffer size of the normal preset, in milliseconds.
+pub const MODE_NORMAL_MS: u32 = 1000;
+/// Buffer size of the buffered preset, in milliseconds.
+pub const MODE_BUFFERED_MS: u32 = 2500;
+/// Lower bound of the custom slider, in milliseconds.
+pub const MODE_MIN_MS: u32 = 50;
+/// Upper bound of the custom slider, in milliseconds.
+pub const MODE_MAX_MS: u32 = 4000;
+
+impl StreamingMode {
+    /// The buffer size this mode asks for, in milliseconds.
+    pub fn latency_ms(self) -> u32 {
+        match self {
+            StreamingMode::RealTime => MODE_REALTIME_MS,
+            StreamingMode::Normal => MODE_NORMAL_MS,
+            StreamingMode::Buffered => MODE_BUFFERED_MS,
+            StreamingMode::Custom(ms) => ms.clamp(MODE_MIN_MS, MODE_MAX_MS),
+        }
+    }
+
+    /// Reconstruct a mode from a stored millisecond value, preferring a preset
+    /// when the value matches one exactly.
+    pub fn from_latency_ms(ms: u32) -> Self {
+        match ms {
+            MODE_REALTIME_MS => StreamingMode::RealTime,
+            MODE_NORMAL_MS => StreamingMode::Normal,
+            MODE_BUFFERED_MS => StreamingMode::Buffered,
+            other => StreamingMode::Custom(other.clamp(MODE_MIN_MS, MODE_MAX_MS)),
+        }
+    }
+}
+
+fn mode_file() -> Option<std::path::PathBuf> {
+    Some(app_dir().join("streaming-mode.txt"))
+}
+
+/// Load the saved streaming mode, or [`StreamingMode::Normal`] if none saved.
+pub fn load_mode() -> StreamingMode {
+    mode_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(StreamingMode::from_latency_ms)
+        .unwrap_or_default()
+}
+
+/// Persist the chosen streaming mode.
+pub fn save_mode(mode: StreamingMode) {
+    if let Some(p) = mode_file() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, mode.latency_ms().to_string());
+    }
+}
+
 fn hotkey_file() -> Option<std::path::PathBuf> {
     Some(app_dir().join("hotkey.txt"))
 }
@@ -129,10 +205,14 @@ pub struct Session {
 impl Session {
     /// Connect (AirPlay 2 transient pairing), set up the stream, and start
     /// pushing live system audio to the device.
-    pub async fn start(mut device: Device, volume: f32) -> anyhow::Result<Self> {
+    pub async fn start(
+        mut device: Device,
+        volume: f32,
+        mode: StreamingMode,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             device.supports_airplay2(),
-        "{} unterstützt kein AirPlay 2 und kann nicht verwendet werden",
+            "{} does not support AirPlay 2 and cannot be used",
             device.name
         );
         let ipv4 = device
@@ -168,6 +248,9 @@ impl Session {
         };
 
         let mut conn = Connection::connect_auto(device, config, "3939").await?;
+        // Latency budget must be set before the stream starts; it sizes the
+        // local buffers and cannot be changed while streaming.
+        conn.set_live_buffer_ms(mode.latency_ms());
         conn.setup().await?;
 
         // Set volume BEFORE audio starts so the first packets aren't at the
@@ -226,6 +309,21 @@ impl Session {
     }
 }
 
+/// Raise the WASAPI capture thread above normal priority.
+///
+/// The capture thread wakes on every device period (a few milliseconds). If it
+/// is descheduled, the loopback ring buffer overruns and audio is lost before it
+/// ever reaches the encoder.
+fn set_capture_thread_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    if ok == 0 {
+        tracing::warn!("could not raise capture thread priority");
+    }
+}
+
 /// Capture the default render endpoint via WASAPI loopback and push PCM frames
 /// to the AirPlay live decoder until `stop` is set.
 fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
@@ -256,6 +354,7 @@ fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result
     let h_event = audio_client.set_get_eventhandle()?;
     let capture_client = audio_client.get_audiocaptureclient()?;
     let mut queue: VecDeque<u8> = VecDeque::new();
+    set_capture_thread_priority();
     audio_client.start_stream()?;
     tracing::info!("loopback capture started ({RATE} Hz, {CHANNELS}ch, f32)");
 
@@ -263,6 +362,13 @@ fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result
                                                  // ~50 ms of silence used to keep the receiver primed while the PC is idle
                                                  // (WASAPI loopback delivers no data when nothing is playing).
     let silence = vec![0i16; (RATE as usize / 20) * CHANNELS as usize];
+    // A read that returns no frames is normal while audio is playing (the event
+    // can fire before a packet is ready). Injecting silence in that case splices
+    // 50 ms of nothing into the middle of the music, which is audible as a
+    // dropout and desynchronises the stream clock. Only treat the source as idle
+    // once no real data has arrived for a while.
+    const IDLE_BEFORE_SILENCE: Duration = Duration::from_millis(120);
+    let mut last_data = std::time::Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         capture_client.read_from_device_to_deque(&mut queue)?;
@@ -286,9 +392,10 @@ fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result
                 channels: CHANNELS,
                 sample_rate: RATE,
             });
-        } else {
-            // Idle: push silence so the receiver's buffer never starves and drops
-            // the stream (which would prevent audio from resuming).
+            last_data = std::time::Instant::now();
+        } else if last_data.elapsed() >= IDLE_BEFORE_SILENCE {
+            // Genuinely idle: push silence so the receiver's buffer never starves
+            // and drops the stream (which would prevent audio from resuming).
             sender.try_send(LivePcmFrame {
                 samples: silence.clone(),
                 channels: CHANNELS,

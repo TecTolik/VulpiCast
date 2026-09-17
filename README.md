@@ -1,72 +1,84 @@
 <p align="center">
-  <img src="assets/vulpicast-logo.png" width="180" alt="VulpiCast-Logo">
+  <img src="assets/vulpicast-logo.png" width="180" alt="VulpiCast logo">
 </p>
 
 # VulpiCast
 
-Mit VulpiCast hörst du den Ton deines Windows-PCs über einen HomePod oder einen
-anderen AirPlay-2-Lautsprecher. Musik, Podcasts, Browser und andere Programme
-werden gemeinsam übertragen.
+VulpiCast plays the sound of your Windows PC on a HomePod or any other AirPlay 2
+speaker. Music, podcasts, your browser and other programs are all streamed
+together.
 
 ## Installation
 
-1. Öffne die Seite [Neueste Version herunterladen](https://github.com/TecTolik/VulpiCast/releases/latest).
-2. Lade die Datei **VulpiCast-Setup.exe** herunter.
-3. Öffne die heruntergeladene Datei und bestätige die Windows-Rückfrage.
-4. Folge dem Installationsassistenten und klicke am Ende auf **Fertigstellen**.
+1. Open the [latest release page](https://github.com/TecTolik/VulpiCast/releases/latest).
+2. Download the file **VulpiCast-Setup.exe**.
+3. Run the downloaded file and confirm the Windows prompt.
+4. Follow the setup wizard and click **Finish** at the end.
 
-Windows kann beim ersten Start eine Sicherheitswarnung anzeigen, weil das
-Installationsprogramm noch nicht digital signiert ist. Wähle in diesem Fall
-**Weitere Informationen** und anschließend **Trotzdem ausführen**.
+Windows may show a security warning the first time, because the installer is not
+digitally signed yet. If that happens, choose **More info** and then
+**Run anyway**.
 
-## So funktioniert es
+## How it works
 
-Nach der Installation erscheint unten rechts neben der Windows-Uhr ein kleines
-Fuchssymbol. Falls du es nicht siehst, klicke zuerst auf den Pfeil für ausgeblendete
-Symbole.
+After installation a small fox icon appears next to the Windows clock in the
+bottom right corner. If you cannot see it, click the arrow for hidden icons
+first.
 
-1. Klicke mit der rechten Maustaste auf das Fuchssymbol.
-2. Wähle deinen Lautsprecher aus der Liste aus.
-3. Spiele auf dem PC Musik oder einen anderen Ton ab.
+1. Right-click the fox icon.
+2. Pick your speaker from the list.
+3. Play music or any other sound on your PC.
 
-Zum Beenden der Übertragung wählst du im selben Menü **Gestoppt**. Unter
-**Einstellungen** kannst du Lautstärke und Tastenkürzel ändern.
+To stop streaming, choose **Stopped** in the same menu. Under **Settings** you can
+change the volume and the keyboard shortcuts.
 
-## Voraussetzungen
+## Requirements
 
-- Windows 10 oder Windows 11 in der 64-Bit-Version
-- ein HomePod oder anderer AirPlay-2-Lautsprecher
-- PC und Lautsprecher im selben privaten WLAN oder Heimnetzwerk
+- Windows 10 or Windows 11, 64-bit
+- a HomePod or another AirPlay 2 speaker
+- PC and speaker on the same private Wi-Fi or home network
 
-## Wenn kein Lautsprecher angezeigt wird
+## If no speaker shows up
 
-1. Prüfe, ob PC und Lautsprecher mit demselben Netzwerk verbunden sind.
-2. Öffne das Fuchsmenü und wähle **Neu nach AirPlay-2-Geräten suchen**.
-3. Prüfe in Windows, ob dein Netzwerk als **Privat** eingestellt ist.
-4. Beende VulpiCast und starte es über das Windows-Startmenü erneut.
+1. Check that your PC and the speaker are connected to the same network.
+2. Open the fox menu and choose **Rescan for AirPlay 2 devices**.
+3. Check in Windows that your network is set to **Private**.
+4. Quit VulpiCast and start it again from the Windows Start menu.
 
-Falls das Problem bleibt, kannst du über **Protokollordner öffnen** die
-Diagnosedatei finden und sie bei einer
-[Fehlermeldung auf GitHub](https://github.com/TecTolik/VulpiCast/issues) anhängen.
+If the problem persists, use **Open log folder** to find the diagnostic file and
+attach it to a [bug report on GitHub](https://github.com/TecTolik/VulpiCast/issues).
 
-## Deinstallation
+## Uninstalling
 
-Öffne **Windows-Einstellungen → Apps → Installierte Apps**, suche nach
-**VulpiCast** und wähle **Deinstallieren**. Programmdateien, Verknüpfungen und die
-Firewall-Regel werden automatisch entfernt.
+Open **Windows Settings → Apps → Installed apps**, look for **VulpiCast** and
+choose **Uninstall**. Program files, shortcuts and the firewall rule are removed
+automatically.
 
-## Datenschutz
+## Privacy
 
-Die Audioübertragung findet ausschließlich in deinem lokalen Netzwerk statt.
-VulpiCast benötigt kein Benutzerkonto, enthält keine Werbung und sendet keine
-Nutzungsdaten an externe Dienste.
+Audio is streamed entirely within your local network. VulpiCast does not require
+an account, contains no ads and sends no usage data to external services.
 
-## Open Source
+## Support the project
 
-VulpiCast ist freie Software unter der GPL-2.0-Lizenz. Das Projekt basiert auf
-[HomePod Cast](https://github.com/iakacer/windows-airplay-homepod) und
-[airplay2-rs](https://github.com/lmcgartland/airplay2-rs). Weitere Angaben stehen
-in der Datei [LICENSE](LICENSE).
+VulpiCast is built in my spare time and stays free and ad-free. If you like it and
+want to support further development, I would be delighted about a small coffee:
 
-Apple, AirPlay, HomePod und Windows sind Marken ihrer jeweiligen Inhaber. Dieses
-Projekt ist nicht mit Apple oder Microsoft verbunden.
+<p align="center">
+  <a href="https://ko-fi.com/plueten">
+    <img src="https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Support me on Ko-fi">
+  </a>
+</p>
+
+Every contribution helps — and a star for the project here on GitHub makes me just
+as happy. Thank you! 🦊
+
+## Open source
+
+VulpiCast is free software licensed under GPL-2.0. The project builds on
+[HomePod Cast](https://github.com/iakacer/windows-airplay-homepod) and
+[airplay2-rs](https://github.com/lmcgartland/airplay2-rs). See the
+[LICENSE](LICENSE) file for details.
+
+Apple, AirPlay, HomePod and Windows are trademarks of their respective owners.
+This project is not affiliated with Apple or Microsoft.
