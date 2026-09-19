@@ -194,6 +194,66 @@ pub async fn discover(timeout: Duration) -> anyhow::Result<Vec<Device>> {
     Ok(devices)
 }
 
+/// A Windows render endpoint that can be used as the loopback capture source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOutput {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+fn output_device_file() -> std::path::PathBuf {
+    app_dir().join("output-device.txt")
+}
+
+/// Load the selected Windows render endpoint. `None` follows the system default.
+pub fn load_output_device() -> Option<String> {
+    std::fs::read_to_string(output_device_file())
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Persist a Windows render endpoint, or an empty value for the system default.
+pub fn save_output_device(device_id: Option<&str>) {
+    let path = output_device_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, device_id.unwrap_or_default());
+}
+
+/// Enumerate active Windows audio outputs available for WASAPI loopback capture.
+pub fn discover_audio_outputs() -> anyhow::Result<Vec<AudioOutput>> {
+    let _ = initialize_mta();
+    let enumerator = DeviceEnumerator::new()?;
+    let default_id = enumerator
+        .get_default_device(&Direction::Render)
+        .and_then(|device| device.get_id())
+        .ok();
+    let collection = enumerator.get_device_collection(&Direction::Render)?;
+    let mut outputs = Vec::new();
+
+    for device in &collection {
+        match device {
+            Ok(device) => match (device.get_id(), device.get_friendlyname()) {
+                (Ok(id), Ok(name)) => outputs.push(AudioOutput {
+                    is_default: default_id.as_deref() == Some(id.as_str()),
+                    id,
+                    name,
+                }),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!("could not read Windows audio output: {e}");
+                }
+            },
+            Err(e) => tracing::warn!("could not enumerate Windows audio output: {e}"),
+        }
+    }
+
+    outputs.sort_by_key(|output| output.name.to_lowercase());
+    Ok(outputs)
+}
+
 /// An active stream to one device: the AirPlay connection plus the background
 /// WASAPI loopback capture thread feeding it.
 pub struct Session {
@@ -209,6 +269,7 @@ impl Session {
         mut device: Device,
         volume: f32,
         mode: StreamingMode,
+        output_device_id: Option<String>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             device.supports_airplay2(),
@@ -265,7 +326,7 @@ impl Session {
         let cap_stop = Arc::new(AtomicBool::new(false));
         let stop2 = cap_stop.clone();
         let cap_handle = std::thread::spawn(move || {
-            if let Err(e) = run_capture(sender, stop2) {
+            if let Err(e) = run_capture(sender, stop2, output_device_id) {
                 tracing::error!("capture error: {e:#}");
             }
         });
@@ -326,12 +387,22 @@ fn set_capture_thread_priority() {
 
 /// Capture the default render endpoint via WASAPI loopback and push PCM frames
 /// to the AirPlay live decoder until `stop` is set.
-fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_capture(
+    sender: LiveFrameSender,
+    stop: Arc<AtomicBool>,
+    output_device_id: Option<String>,
+) -> anyhow::Result<()> {
     // Keep the COM guard alive for the lifetime of this thread.
     let _com = initialize_mta();
 
     let enumerator = DeviceEnumerator::new()?;
-    let device = enumerator.get_default_device(&Direction::Render)?;
+    let device = match output_device_id.as_deref() {
+        Some(id) => enumerator.get_device(id)?,
+        None => enumerator.get_default_device(&Direction::Render)?,
+    };
+    let output_name = device
+        .get_friendlyname()
+        .unwrap_or_else(|_| "Unknown output".to_string());
     let mut audio_client = device.get_iaudioclient()?;
 
     // Render device + Capture direction + Shared mode => loopback. autoconvert
@@ -356,7 +427,10 @@ fn run_capture(sender: LiveFrameSender, stop: Arc<AtomicBool>) -> anyhow::Result
     let mut queue: VecDeque<u8> = VecDeque::new();
     set_capture_thread_priority();
     audio_client.start_stream()?;
-    tracing::info!("loopback capture started ({RATE} Hz, {CHANNELS}ch, f32)");
+    tracing::info!(
+        output = %output_name,
+        "loopback capture started ({RATE} Hz, {CHANNELS}ch, f32)"
+    );
 
     let bytes_per_frame = CHANNELS as usize * 4; // f32 per sample
                                                  // ~50 ms of silence used to keep the receiver primed while the PC is idle

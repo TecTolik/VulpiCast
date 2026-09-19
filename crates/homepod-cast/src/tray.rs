@@ -2,7 +2,7 @@
 //!
 //! The tray (main thread) renders state and turns clicks / the global hotkey
 //! into commands. A dedicated control thread owns the tokio runtime and the
-//! active streaming session, and reports the *true* state back so the icon and
+//! active streaming sessions, and reports the *true* state back so the icon and
 //! check marks stay correct (e.g. if a connection fails).
 //!
 //! Volume, the streaming mode and the global toggle hotkey are configured in a
@@ -10,10 +10,11 @@
 //! applies volume live, and Save reports the hotkey (which the main thread
 //! re-registers) along with the streaming mode.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -36,10 +37,13 @@ const DEFAULT_HOTKEY_VK: u32 = 0x48; // 'H'
 
 /// Commands sent from the tray to the control thread.
 enum Cmd {
-    Start(usize),
-    Stop,
+    SetTargets(Vec<usize>),
     Rescan,
     SetVolume(f32),
+    /// Change the Windows render endpoint captured through WASAPI loopback.
+    /// Active sessions are restarted so every target switches atomically from
+    /// the tray's point of view.
+    SetOutput(Option<String>),
     /// New streaming mode. Applied immediately by reconnecting if a stream is
     /// running, since the buffer size is fixed when the stream starts.
     SetMode(cast::StreamingMode),
@@ -48,9 +52,9 @@ enum Cmd {
 
 /// True state reported by the control thread back to the tray.
 enum Status {
-    Streaming(usize),
+    Streaming(Vec<usize>),
     Stopped,
-    Error(String),
+    Error { active: Vec<usize>, message: String },
 }
 
 enum DeviceUpdate {
@@ -87,11 +91,19 @@ pub fn run() -> anyhow::Result<()> {
         DeviceUpdate::Ready(names) => names.clone(),
         DeviceUpdate::Failed(_) => Vec::new(),
     };
+    let audio_outputs = cast::discover_audio_outputs().unwrap_or_else(|e| {
+        tracing::error!("Windows audio output discovery failed: {e:#}");
+        Vec::new()
+    });
+    let saved_output = cast::load_output_device();
+    let mut selected_output =
+        saved_output.filter(|id| audio_outputs.iter().any(|output| output.id == *id));
+    let _ = cmd_tx.send(Cmd::SetOutput(selected_output.clone()));
 
     // --- Build the menu ---
     let menu = Menu::new();
 
-    // Single-selection group: "Stopped" + one item per device. Starts stopped.
+    // Each AirPlay target is an independent toggle, so any subset can stream.
     let off_check = CheckMenuItem::new("\u{25A0}  Stopped", true, true, None);
     menu.append(&off_check)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -106,6 +118,32 @@ pub fn run() -> anyhow::Result<()> {
         &mut device_ids,
         &mut no_devices_item,
     )?;
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let output_menu = Submenu::new("Windows audio output", true);
+    let default_name = audio_outputs
+        .iter()
+        .find(|output| output.is_default)
+        .map(|output| format!("System default — {}", output.name))
+        .unwrap_or_else(|| "System default".to_string());
+    let default_output_check =
+        CheckMenuItem::new(default_name, true, selected_output.is_none(), None);
+    let default_output_id = default_output_check.id().clone();
+    output_menu.append(&default_output_check)?;
+    let mut output_checks = Vec::new();
+    let mut output_ids = Vec::new();
+    for output in &audio_outputs {
+        let item = CheckMenuItem::new(
+            &output.name,
+            true,
+            selected_output.as_deref() == Some(output.id.as_str()),
+            None,
+        );
+        output_ids.push((item.id().clone(), output.id.clone()));
+        output_menu.append(&item)?;
+        output_checks.push(item);
+    }
+    menu.append(&output_menu)?;
     menu.append(&PredefinedMenuItem::separator())?;
 
     let rescan_item = MenuItem::new("Rescan for AirPlay 2 devices", true, None);
@@ -149,8 +187,8 @@ pub fn run() -> anyhow::Result<()> {
     let menu_rx = tray_icon::menu::MenuEvent::receiver();
 
     // UI state (optimistic; corrected by Status from the control thread).
-    let mut active: Option<usize> = None; // None = stopped
-    let mut last_device: usize = 0; // hotkey target when toggling on
+    let mut active = BTreeSet::<usize>::new();
+    let mut last_targets = BTreeSet::<usize>::new();
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     let mut quit = false;
@@ -158,14 +196,21 @@ pub fn run() -> anyhow::Result<()> {
         // Pump Windows messages (drives the tray + delivers WM_HOTKEY).
         while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
             if msg.message == WM_HOTKEY && msg.wParam == HOTKEY_ID as usize {
-                if active.is_some() {
-                    let _ = cmd_tx.send(Cmd::Stop);
-                    active = None;
+                if !active.is_empty() {
+                    last_targets = active.clone();
+                    active.clear();
                 } else if !device_checks.is_empty() {
-                    let _ = cmd_tx.send(Cmd::Start(last_device));
-                    active = Some(last_device);
+                    active = last_targets
+                        .iter()
+                        .copied()
+                        .filter(|idx| *idx < device_checks.len())
+                        .collect();
+                    if active.is_empty() {
+                        active.insert(0);
+                    }
                 }
-                apply_state(&off_check, &device_checks, &tray, active);
+                let _ = cmd_tx.send(Cmd::SetTargets(active.iter().copied().collect()));
+                apply_state(&off_check, &device_checks, &tray, &active);
             }
             unsafe {
                 TranslateMessage(&msg);
@@ -179,11 +224,12 @@ pub fn run() -> anyhow::Result<()> {
                 let _ = cmd_tx.send(Cmd::Quit);
                 quit = true;
             } else if ev.id == off_id {
-                if active.is_some() {
-                    let _ = cmd_tx.send(Cmd::Stop);
-                    active = None;
+                if !active.is_empty() {
+                    last_targets = active.clone();
+                    active.clear();
+                    let _ = cmd_tx.send(Cmd::SetTargets(Vec::new()));
                 }
-                apply_state(&off_check, &device_checks, &tray, active);
+                apply_state(&off_check, &device_checks, &tray, &active);
             } else if ev.id == settings_id {
                 // Open the settings window: volume applies live via Cmd::SetVolume;
                 // on Save the hotkey comes back on hk_tx for the main thread to
@@ -207,9 +253,9 @@ pub fn run() -> anyhow::Result<()> {
                 );
             } else if ev.id == rescan_id {
                 let _ = cmd_tx.send(Cmd::Rescan);
-                active = None;
+                active.clear();
                 status_item.set_text("Scanning\u{2026}");
-                apply_state(&off_check, &device_checks, &tray, active);
+                apply_state(&off_check, &device_checks, &tray, &active);
             } else if ev.id == log_id {
                 if let Err(e) = std::process::Command::new("explorer.exe")
                     .arg(cast::app_dir())
@@ -217,22 +263,54 @@ pub fn run() -> anyhow::Result<()> {
                 {
                     tracing::error!("failed to open log folder: {e}");
                 }
+            } else if ev.id == default_output_id {
+                if selected_output.is_some() {
+                    selected_output = None;
+                    cast::save_output_device(None);
+                    let _ = cmd_tx.send(Cmd::SetOutput(None));
+                    apply_output_state(
+                        &default_output_check,
+                        &output_checks,
+                        &audio_outputs,
+                        selected_output.as_deref(),
+                    );
+                    status_item.set_text("Switching Windows audio output\u{2026}");
+                }
+            } else if let Some(output_id) = output_ids
+                .iter()
+                .find(|(id, _)| *id == ev.id)
+                .map(|(_, id)| id.clone())
+            {
+                if selected_output.as_deref() != Some(output_id.as_str()) {
+                    selected_output = Some(output_id);
+                    cast::save_output_device(selected_output.as_deref());
+                    let _ = cmd_tx.send(Cmd::SetOutput(selected_output.clone()));
+                    apply_output_state(
+                        &default_output_check,
+                        &output_checks,
+                        &audio_outputs,
+                        selected_output.as_deref(),
+                    );
+                    status_item.set_text("Switching Windows audio output\u{2026}");
+                }
             } else if let Some(idx) = device_ids
                 .iter()
                 .find(|(id, _)| *id == ev.id)
                 .map(|(_, i)| *i)
             {
-                last_device = idx;
-                if active != Some(idx) {
-                    let _ = cmd_tx.send(Cmd::Start(idx));
-                    active = Some(idx);
+                if !active.remove(&idx) {
+                    active.insert(idx);
                 }
-                apply_state(&off_check, &device_checks, &tray, active);
+                if !active.is_empty() {
+                    last_targets = active.clone();
+                }
+                let _ = cmd_tx.send(Cmd::SetTargets(active.iter().copied().collect()));
+                apply_state(&off_check, &device_checks, &tray, &active);
             }
         }
 
         while let Ok(update) = dev_rx.try_recv() {
-            active = None;
+            active.clear();
             let mut tooltip_override = None;
             match update {
                 DeviceUpdate::Ready(names) => {
@@ -243,7 +321,7 @@ pub fn run() -> anyhow::Result<()> {
                         &mut device_ids,
                         &mut no_devices_item,
                     )?;
-                    last_device = 0;
+                    last_targets.clear();
                     status_item.set_text("Ready — AirPlay 2 only");
                 }
                 DeviceUpdate::Failed(message) => {
@@ -259,7 +337,7 @@ pub fn run() -> anyhow::Result<()> {
                     tooltip_override = Some("VulpiCast — device discovery failed".to_string());
                 }
             }
-            apply_state(&off_check, &device_checks, &tray, active);
+            apply_state(&off_check, &device_checks, &tray, &active);
             if let Some(tooltip) = tooltip_override {
                 let _ = tray.set_tooltip(Some(tooltip));
             }
@@ -277,28 +355,43 @@ pub fn run() -> anyhow::Result<()> {
         while let Ok(st) = status_rx.try_recv() {
             let mut tooltip_override = None;
             active = match st {
-                Status::Streaming(i) => {
-                    last_device = i;
-                    status_item.set_text("Connected via native AirPlay 2");
-                    Some(i)
+                Status::Streaming(indices) => {
+                    let active: BTreeSet<_> = indices.into_iter().collect();
+                    if !active.is_empty() {
+                        last_targets = active.clone();
+                    }
+                    status_item.set_text(if active.len() == 1 {
+                        "Connected to 1 AirPlay 2 device"
+                    } else {
+                        "Connected to multiple AirPlay 2 devices"
+                    });
+                    active
                 }
                 Status::Stopped => {
                     status_item.set_text("Ready — AirPlay 2 only");
-                    None
+                    BTreeSet::new()
                 }
-                Status::Error(message) => {
+                Status::Error {
+                    active: indices,
+                    message,
+                } => {
                     tracing::error!("streaming error: {message}");
-                    status_item.set_text("Connection failed — see log");
+                    let active: BTreeSet<_> = indices.into_iter().collect();
+                    status_item.set_text(if active.is_empty() {
+                        "Connection failed — see log"
+                    } else {
+                        "Some connections failed — see log"
+                    });
                     let short = if message.chars().count() > 100 {
                         format!("{}\u{2026}", message.chars().take(100).collect::<String>())
                     } else {
                         message
                     };
                     tooltip_override = Some(format!("VulpiCast — {short}"));
-                    None
+                    active
                 }
             };
-            apply_state(&off_check, &device_checks, &tray, active);
+            apply_state(&off_check, &device_checks, &tray, &active);
             if let Some(tooltip) = tooltip_override {
                 let _ = tray.set_tooltip(Some(tooltip));
             }
@@ -321,17 +414,34 @@ fn apply_state(
     off: &CheckMenuItem,
     devices: &[CheckMenuItem],
     tray: &TrayIcon,
-    active: Option<usize>,
+    active: &BTreeSet<usize>,
 ) {
-    off.set_checked(active.is_none());
+    off.set_checked(active.is_empty());
     for (i, c) in devices.iter().enumerate() {
-        c.set_checked(active == Some(i));
+        c.set_checked(active.contains(&i));
     }
-    let _ = tray.set_icon(Some(make_icon(active.is_some())));
-    if active.is_some() {
-        let _ = tray.set_tooltip(Some("VulpiCast — streaming via AirPlay 2"));
+    let _ = tray.set_icon(Some(make_icon(!active.is_empty())));
+    if active.len() == 1 {
+        let _ = tray.set_tooltip(Some("VulpiCast — streaming to 1 AirPlay 2 device"));
+    } else if active.len() > 1 {
+        let _ = tray.set_tooltip(Some(format!(
+            "VulpiCast — streaming to {} AirPlay 2 devices",
+            active.len()
+        )));
     } else {
         let _ = tray.set_tooltip(Some("VulpiCast — ready (AirPlay 2 only)"));
+    }
+}
+
+fn apply_output_state(
+    default_output: &CheckMenuItem,
+    outputs: &[CheckMenuItem],
+    available: &[cast::AudioOutput],
+    selected_id: Option<&str>,
+) {
+    default_output.set_checked(selected_id.is_none());
+    for (item, output) in outputs.iter().zip(available) {
+        item.set_checked(selected_id == Some(output.id.as_str()));
     }
 }
 
@@ -365,7 +475,92 @@ fn replace_device_menu(
     Ok(())
 }
 
-/// Owns the tokio runtime and the active session; reports state via `status_tx`.
+fn normalize_targets(targets: Vec<usize>, device_count: usize) -> BTreeSet<usize> {
+    targets
+        .into_iter()
+        .filter(|idx| *idx < device_count)
+        .collect()
+}
+
+fn active_indices(sessions: &BTreeMap<usize, cast::Session>) -> Vec<usize> {
+    sessions.keys().copied().collect()
+}
+
+fn report_sessions(
+    status_tx: &Sender<Status>,
+    sessions: &BTreeMap<usize, cast::Session>,
+    errors: Vec<String>,
+) {
+    let active = active_indices(sessions);
+    let status = if !errors.is_empty() {
+        Status::Error {
+            active,
+            message: errors.join("; "),
+        }
+    } else if active.is_empty() {
+        Status::Stopped
+    } else {
+        Status::Streaming(active)
+    };
+    let _ = status_tx.send(status);
+}
+
+fn stop_all_sessions(rt: &tokio::runtime::Runtime, sessions: &mut BTreeMap<usize, cast::Session>) {
+    while let Some((idx, session)) = sessions.pop_first() {
+        rt.block_on(session.stop());
+        tracing::info!(target_index = idx, "stopped AirPlay stream");
+    }
+}
+
+fn reconcile_targets(
+    rt: &tokio::runtime::Runtime,
+    devices: &[airplay_core::device::Device],
+    sessions: &mut BTreeMap<usize, cast::Session>,
+    targets: Vec<usize>,
+    volume: f32,
+    mode: cast::StreamingMode,
+    output_device_id: Option<&str>,
+) -> Vec<String> {
+    let desired = normalize_targets(targets, devices.len());
+    let removed: Vec<_> = sessions
+        .keys()
+        .copied()
+        .filter(|idx| !desired.contains(idx))
+        .collect();
+    for idx in removed {
+        if let Some(session) = sessions.remove(&idx) {
+            rt.block_on(session.stop());
+            tracing::info!(target_index = idx, "stopped AirPlay stream");
+        }
+    }
+
+    let mut errors = Vec::new();
+    for idx in desired {
+        if sessions.contains_key(&idx) {
+            continue;
+        }
+        let device = devices[idx].clone();
+        let name = device.name.clone();
+        match rt.block_on(cast::Session::start(
+            device,
+            volume,
+            mode,
+            output_device_id.map(str::to_owned),
+        )) {
+            Ok(session) => {
+                tracing::info!(device = %name, "streaming started");
+                sessions.insert(idx, session);
+            }
+            Err(e) => {
+                tracing::error!(device = %name, "failed to start streaming: {e:#}");
+                errors.push(format!("Connection to {name} failed: {e:#}"));
+            }
+        }
+    }
+    errors
+}
+
+/// Owns the tokio runtime and all active sessions; reports state via `status_tx`.
 fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: Sender<Status>) {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -392,51 +587,28 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
         }
     };
 
-    let mut session: Option<cast::Session> = None;
+    let mut sessions = BTreeMap::<usize, cast::Session>::new();
     let mut volume = cast::load_volume();
     let mut mode = cast::load_mode();
-    // Which device the running session belongs to, so a mode change can restart
-    // it on the same target.
-    let mut active_idx: Option<usize> = None;
+    let mut output_device_id = cast::load_output_device();
     let mut last_feedback = std::time::Instant::now();
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(1000)) {
-            Ok(Cmd::Start(idx)) => {
-                if let Some(s) = session.take() {
-                    rt.block_on(s.stop());
-                }
-                active_idx = None;
-                if let Some(dev) = devices.get(idx).cloned() {
-                    let name = dev.name.clone();
-                    match rt.block_on(cast::Session::start(dev, volume, mode)) {
-                        Ok(s) => {
-                            tracing::info!("streaming to {name}");
-                            session = Some(s);
-                            active_idx = Some(idx);
-                            last_feedback = std::time::Instant::now();
-                            let _ = status_tx.send(Status::Streaming(idx));
-                        }
-                        Err(e) => {
-                            tracing::error!("failed to start streaming to {name}: {e:#}");
-                            let _ = status_tx
-                                .send(Status::Error(format!("Connection to {name} failed: {e:#}")));
-                        }
-                    }
-                }
-            }
-            Ok(Cmd::Stop) => {
-                if let Some(s) = session.take() {
-                    rt.block_on(s.stop());
-                    tracing::info!("stopped");
-                }
-                active_idx = None;
-                let _ = status_tx.send(Status::Stopped);
+            Ok(Cmd::SetTargets(targets)) => {
+                let errors = reconcile_targets(
+                    &rt,
+                    &devices,
+                    &mut sessions,
+                    targets,
+                    volume,
+                    mode,
+                    output_device_id.as_deref(),
+                );
+                last_feedback = std::time::Instant::now();
+                report_sessions(&status_tx, &sessions, errors);
             }
             Ok(Cmd::Rescan) => {
-                if let Some(s) = session.take() {
-                    rt.block_on(s.stop());
-                }
-                active_idx = None;
+                stop_all_sessions(&rt, &mut sessions);
                 let _ = status_tx.send(Status::Stopped);
                 match rt.block_on(cast::discover(Duration::from_secs(3))) {
                     Ok(found) => {
@@ -454,8 +626,8 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
             Ok(Cmd::SetVolume(v)) => {
                 volume = v;
                 cast::save_volume(v);
-                if let Some(s) = session.as_mut() {
-                    rt.block_on(s.set_volume(v));
+                for session in sessions.values_mut() {
+                    rt.block_on(session.set_volume(v));
                 }
             }
             Ok(Cmd::SetMode(new_mode)) => {
@@ -463,36 +635,41 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
                     mode = new_mode;
                     cast::save_mode(mode);
                     tracing::info!("streaming mode set to {}ms buffer", mode.latency_ms());
-                    // The buffer size is baked in when the stream starts, so a
-                    // running stream has to be reconnected to pick it up.
-                    if let (Some(s), Some(idx)) = (session.take(), active_idx) {
-                        rt.block_on(s.stop());
-                        active_idx = None;
-                        if let Some(dev) = devices.get(idx).cloned() {
-                            let name = dev.name.clone();
-                            match rt.block_on(cast::Session::start(dev, volume, mode)) {
-                                Ok(s) => {
-                                    tracing::info!("restarted stream to {name} with new mode");
-                                    session = Some(s);
-                                    active_idx = Some(idx);
-                                    last_feedback = std::time::Instant::now();
-                                    let _ = status_tx.send(Status::Streaming(idx));
-                                }
-                                Err(e) => {
-                                    tracing::error!("failed to restart streaming to {name}: {e:#}");
-                                    let _ = status_tx.send(Status::Error(format!(
-                                        "Connection to {name} failed: {e:#}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
+                    let targets = active_indices(&sessions);
+                    stop_all_sessions(&rt, &mut sessions);
+                    let errors = reconcile_targets(
+                        &rt,
+                        &devices,
+                        &mut sessions,
+                        targets,
+                        volume,
+                        mode,
+                        output_device_id.as_deref(),
+                    );
+                    last_feedback = std::time::Instant::now();
+                    report_sessions(&status_tx, &sessions, errors);
+                }
+            }
+            Ok(Cmd::SetOutput(new_output_device_id)) => {
+                if new_output_device_id != output_device_id {
+                    output_device_id = new_output_device_id;
+                    let targets = active_indices(&sessions);
+                    stop_all_sessions(&rt, &mut sessions);
+                    let errors = reconcile_targets(
+                        &rt,
+                        &devices,
+                        &mut sessions,
+                        targets,
+                        volume,
+                        mode,
+                        output_device_id.as_deref(),
+                    );
+                    last_feedback = std::time::Instant::now();
+                    report_sessions(&status_tx, &sessions, errors);
                 }
             }
             Ok(Cmd::Quit) => {
-                if let Some(s) = session.take() {
-                    rt.block_on(s.stop());
-                }
+                stop_all_sessions(&rt, &mut sessions);
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -501,30 +678,53 @@ fn control_loop(cmd_rx: Receiver<Cmd>, dev_tx: Sender<DeviceUpdate>, status_tx: 
 
         // Periodic AirPlay keepalive — without it the HomePod tears down the
         // session and audio stops after a short while.
-        let feedback_error = if let Some(s) = session.as_mut() {
-            if last_feedback.elapsed() >= Duration::from_secs(2) {
-                last_feedback = std::time::Instant::now();
-                rt.block_on(s.feedback()).err()
-            } else {
-                None
+        if !sessions.is_empty() && last_feedback.elapsed() >= Duration::from_secs(2) {
+            last_feedback = std::time::Instant::now();
+            let mut failed = Vec::new();
+            for (&idx, session) in sessions.iter_mut() {
+                if let Err(e) = rt.block_on(session.feedback()) {
+                    let name = devices
+                        .get(idx)
+                        .map(|device| device.name.as_str())
+                        .unwrap_or("unknown device");
+                    failed.push((idx, format!("{name}: {e:#}")));
+                }
             }
-        } else {
-            None
-        };
-        if let Some(e) = feedback_error {
-            tracing::error!("AirPlay keepalive failed: {e:#}");
-            if let Some(s) = session.take() {
-                rt.block_on(s.stop());
+            if !failed.is_empty() {
+                let mut errors = Vec::new();
+                for (idx, message) in failed {
+                    tracing::error!(target_index = idx, "AirPlay keepalive failed: {message}");
+                    if let Some(session) = sessions.remove(&idx) {
+                        rt.block_on(session.stop());
+                    }
+                    errors.push(format!("AirPlay connection was interrupted: {message}"));
+                }
+                report_sessions(&status_tx, &sessions, errors);
             }
-            active_idx = None;
-            let _ = status_tx.send(Status::Error(format!(
-                "AirPlay connection was interrupted: {e:#}"
-            )));
         }
     }
     // The library leaks an infinite spawn_blocking task per session, so a normal
     // runtime drop would hang. Force shutdown instead.
     rt.shutdown_timeout(Duration::from_millis(300));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_targets;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn target_selection_deduplicates_and_ignores_stale_indices() {
+        assert_eq!(
+            normalize_targets(vec![2, 0, 2, 7, 1], 3),
+            BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn empty_target_selection_stops_all_devices() {
+        assert!(normalize_targets(Vec::new(), 3).is_empty());
+    }
 }
 
 /// Branded 32x32 fox icon; muted while idle and fully colored while streaming.

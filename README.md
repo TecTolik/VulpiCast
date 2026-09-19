@@ -26,11 +26,14 @@ bottom right corner. If you cannot see it, click the arrow for hidden icons
 first.
 
 1. Right-click the fox icon.
-2. Pick your speaker from the list.
+2. Pick one or more speakers from the list. Click a selected speaker again to
+   remove it from the active group.
 3. Play music or any other sound on your PC.
 
 To stop streaming, choose **Stopped** in the same menu. Under **Settings** you can
-change the volume and the keyboard shortcuts.
+change the volume and the keyboard shortcuts. Use **Windows audio output** in
+the tray menu to choose which playback device is captured; **System default**
+follows the current Windows default device.
 
 ## Requirements
 

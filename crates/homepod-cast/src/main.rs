@@ -65,6 +65,7 @@ fn main() -> anyhow::Result<()> {
                 dev.clone(),
                 cast::DEFAULT_VOLUME,
                 cast::load_mode(),
+                cast::load_output_device(),
             )
             .await
             {
