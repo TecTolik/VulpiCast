@@ -7,6 +7,7 @@
 
 # Upstream analysis/scratch
 framework_analysis
+/graphify-out/
 cross-compile.sh
 deploy-to-pi.sh
 
